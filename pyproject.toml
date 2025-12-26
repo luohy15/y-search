@@ -1,0 +1,12 @@
+[project]
+name = "y-search"
+version = "0.1.0"
+description = "AWS Lambda template for fetching and storing y search data"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "loguru>=0.7.3",
+    "psycopg[binary]>=3.3.2",
+    "python-dotenv>=1.2.1",
+    "sqlalchemy>=2.0.45",
+]

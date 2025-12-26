@@ -1,0 +1,71 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Minimal AWS Lambda template
+
+Parameters:
+  DatabaseUrl:
+    Type: String
+    Description: Database connection URL
+    NoEcho: true
+
+  LambdaSecurityGroupId:
+    Type: String
+    Description: Security Group ID for Lambda functions
+
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: Comma-delimited list of subnet IDs
+
+Globals:
+  Function:
+    Timeout: 300
+    MemorySize: 512
+    Runtime: python3.13
+
+Resources:
+  APIFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-api
+      CodeUri: .
+      Handler: handler.api_handler.api_handler
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-lambda-role
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref DatabaseUrl
+      FunctionUrlConfig:
+        AuthType: NONE
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-worker
+      CodeUri: .
+      Handler: handler.worker_handler.worker_handler
+      MemorySize: 1024
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-lambda-role
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref DatabaseUrl
+
+Outputs:
+  APIFunctionUrl:
+    Description: API Function URL
+    Value: !GetAtt APIFunctionUrl.FunctionUrl
+
+  APIFunctionArn:
+    Description: API Function ARN
+    Value: !GetAtt APIFunction.Arn
+
+  WorkerFunctionArn:
+    Description: Worker Function ARN
+    Value: !GetAtt WorkerFunction.Arn
+

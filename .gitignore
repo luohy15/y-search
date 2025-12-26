@@ -1,0 +1,21 @@
+.claude
+.specify
+template.yaml.bak
+.aws-sam/
+.env
+.env.local
+dev_docs
+requirements.txt
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+.DS_Store
