@@ -2,6 +2,7 @@ import json
 from datetime import datetime, timezone
 
 from service.init_db import handle_init_db
+from service.note import handle_ingest_notes
 
 
 def route_message(message):
@@ -12,6 +13,9 @@ def route_message(message):
 
     if action == "init_db":
         return handle_init_db()
+
+    if action == "ingest_notes":
+        return handle_ingest_notes(message)
 
     return {
         "action": action,
@@ -56,6 +60,13 @@ def worker_handler(event, _context):
 
 
 if __name__ == "__main__":
-    test_event = {"action": "init_db", "data": "sample"}
+    # Test init_db action
+    # test_event = {"action": "init_db"}
+    # result = worker_handler(test_event, None)
+    # print(json.dumps(result, indent=2))
+
+    # Test ingest_notes action (uses default prefix "notes/")
+    # For dev: set OBJECT_STORAGE_TYPE=fs and STORAGE_ROOT to local path
+    test_event = {"action": "ingest_notes", "prefix": "notes/"}
     result = worker_handler(test_event, None)
     print(json.dumps(result, indent=2))

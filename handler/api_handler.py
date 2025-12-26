@@ -1,10 +1,24 @@
+"""
+Lambda handler for search API.
+"""
 import json
+from typing import Any
 
-from service.example import list_examples
+from loguru import logger
+
+from service import document as document_service
 
 
-def api_handler(event, _context):
-    """Handle API requests."""
+def handler(event: dict, _context: Any) -> dict:
+    """
+    Main Lambda handler for search API.
+
+    Routes:
+        GET /search - Search documents
+    """
+    logger.info(f"Received event: {json.dumps(event)}")
+
+    # Extract HTTP method and path
     http_method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
     path = event.get("rawPath", "/")
 
@@ -17,33 +31,53 @@ def api_handler(event, _context):
         multi_params = event.get("multiValueQueryStringParameters") or {}
         query_params = {k: v[0] if isinstance(v, list) and v else v for k, v in multi_params.items()}
 
-    if path == "/examples" and http_method == "GET":
-        limit = int(query_params.get("limit", 100))
-        offset = int(query_params.get("offset", 0))
-        examples = list_examples(limit=limit, offset=offset)
-        return {
-            "statusCode": 200,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({"examples": examples, "limit": limit, "offset": offset}),
-        }
+    # Route request
+    try:
+        if path == "/search" and http_method == "GET":
+            return _handle_search(query_params)
+        else:
+            return _response(404, {"error": "Not found"})
+    except Exception as e:
+        logger.exception(f"Error handling request: {e}")
+        return _response(500, {"error": str(e)})
 
+
+def _handle_search(query_params: dict) -> dict:
+    """
+    Handle GET /search
+
+    Query parameters:
+        query: Search query string (required)
+        limit: Maximum number of results (optional, default 10)
+    """
+    query = query_params.get("query")
+    if not query:
+        return _response(400, {"error": "Missing required parameter: query"})
+
+    limit = int(query_params.get("limit", 10))
+
+    result = document_service.search(query=query, limit=limit)
+
+    return _response(200, result)
+
+
+def _response(status_code: int, body: dict) -> dict:
+    """Build API Gateway response."""
     return {
-        "statusCode": 200,
-        "headers": {"Content-Type": "application/json"},
-        "body": json.dumps({
-            "message": "Y Search API",
-            "method": http_method,
-            "path": path,
-            "query_params": query_params,
-        }),
+        "statusCode": status_code,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+        },
+        "body": json.dumps(body, ensure_ascii=False),
     }
 
 
 if __name__ == "__main__":
     test_event = {
         "requestContext": {"http": {"method": "GET"}},
-        "rawPath": "/examples",
-        "queryStringParameters": {"symbol": "AAPL"},
+        "rawPath": "/search",
+        "queryStringParameters": {"query": "search", "limit": "5"},
     }
-    result = api_handler(test_event, None)
-    print(json.dumps(result, indent=2))
+    result = handler(test_event, None)
+    print(json.dumps(json.loads(result["body"]), indent=2, ensure_ascii=False))
