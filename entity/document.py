@@ -28,11 +28,14 @@ class Document(BaseEntity):
 
     # Search indexes
     content_tsvector = Column(TSVECTOR, nullable=True)  # PostgreSQL full-text search
-    embedding = Column(Vector(1536), nullable=True)  # OpenAI ada-002 dimension
+    embedding = Column(Vector(1536), nullable=True)  # Reduced dimension for HNSW compatibility
 
     __table_args__ = (
         # GIN index for full-text search
         Index('idx_documents_content_tsvector', 'content_tsvector', postgresql_using='gin'),
+        # GIN index with pg_trgm for similarity search (supports CJK)
+        Index('idx_documents_content_trgm', 'content_text', postgresql_using='gin',
+              postgresql_ops={'content_text': 'gin_trgm_ops'}),
         # HNSW index for vector similarity (faster than IVFFlat for < 1M rows)
         Index('idx_documents_embedding', 'embedding', postgresql_using='hnsw',
               postgresql_with={'m': 16, 'ef_construction': 64},

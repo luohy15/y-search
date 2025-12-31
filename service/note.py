@@ -5,34 +5,16 @@ Ingests note data from object storage (S3) or local filesystem (dev).
 Uses content hashing for efficient change detection.
 """
 import hashlib
-import os
+import uuid
 from dataclasses import dataclass
 
 from loguru import logger
 from sqlalchemy import text
 
 from config.database import get_db
-from config.embedding_factory import EmbeddingConfig, create_embedding_client
-from config.object_storage import list_objects, get_object
+from config.embedding_factory import get_embeddings
+from config.object_storage import list_objects_with_metadata, get_object
 from entity.document import Document
-
-
-def _get_embeddings(texts: list[str]) -> list[list[float]]:
-    """Generate embeddings for a list of texts using configured provider."""
-    if not texts:
-        return []
-    config = EmbeddingConfig(
-        embedding_provider=os.environ.get("EMBEDDING_PROVIDER", "openrouter"),
-        embedding_model=os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small"),
-        embedding_base_url=os.environ.get("EMBEDDING_BASE_URL"),
-        embedding_api_key=os.environ.get("EMBEDDING_API_KEY"),
-    )
-    client = create_embedding_client(config)
-    response = client.embeddings.create(
-        model=config.embedding_model,
-        input=texts,
-    )
-    return [item.embedding for item in response.data]
 
 
 @dataclass
@@ -66,7 +48,7 @@ def _extract_title(content: str, filename: str | None = None) -> str | None:
     return None
 
 
-def ingest_notes(prefix: str = "notes/", delete_missing: bool = True) -> dict:
+def ingest_notes(prefix: str = "", delete_missing: bool = True, count: int | None = None) -> dict:
     """
     Ingest note data from object storage with efficient change detection.
 
@@ -77,8 +59,9 @@ def ingest_notes(prefix: str = "notes/", delete_missing: bool = True) -> dict:
     4. Only process changed files
 
     Args:
-        prefix: Object storage prefix to scan for note files (default: "notes/")
+        prefix: Object storage prefix to scan for note files (default: "")
         delete_missing: If True, delete documents not found in storage (default: True)
+        count: Max number of new documents to create (default: None = unlimited)
 
     Returns:
         dict with status and detailed sync statistics
@@ -86,45 +69,62 @@ def ingest_notes(prefix: str = "notes/", delete_missing: bool = True) -> dict:
     logger.info(f"Starting note sync from prefix: {prefix}")
     stats = SyncStats()
 
-    # List all objects under the prefix
-    keys = list_objects(prefix=prefix)
-    storage_files = {k for k in keys if k.endswith(".md")}
-    stats.skipped = len(keys) - len(storage_files)
-    logger.info(f"Found {len(storage_files)} markdown files ({stats.skipped} skipped)")
+    # List all objects under the prefix with metadata
+    objects_with_metadata = list_objects_with_metadata(prefix=prefix, max_keys=10000)
+    md_files_with_metadata = [
+        obj for obj in objects_with_metadata
+        if obj['key'].endswith(".md") and not obj['key'].startswith("assets/")
+    ]
+    stats.skipped = len(objects_with_metadata) - len(md_files_with_metadata)
+    logger.info(f"Found {len(md_files_with_metadata)} markdown files ({stats.skipped} skipped)")
 
     with get_db() as session:
-        # Step 1: Load existing documents into memory (id -> content_hash)
-        # Note: CHAR(36) pads with spaces, so strip() is needed for comparison
+        # Step 1: Load existing documents into memory (filename -> content_hash)
         existing_docs = {
-            doc.id.strip(): doc.content_hash
-            for doc in session.query(Document.id, Document.content_hash)
+            doc.filename: doc.content_hash
+            for doc in session.query(Document.filename, Document.content_hash)
             .filter(Document.doc_type == 1)  # notes only
             .all()
         }
         logger.info(f"Found {len(existing_docs)} existing notes in DB")
 
-        # Step 2: Build map of storage files (doc_id -> key)
+        # Step 2: Build map of storage files (filename -> {key, last_modified})
         storage_map = {}
-        for key in storage_files:
-            doc_id = key.split("/")[-1]
-            storage_map[doc_id] = key
+        for obj in md_files_with_metadata:
+            key = obj['key']
+            filename = key.split("/")[-1]
+            storage_map[filename] = {
+                'key': key,
+                'last_modified': obj['last_modified']
+            }
 
         # Step 3: Categorize changes
-        existing_ids = set(existing_docs.keys())
-        storage_ids = set(storage_map.keys())
+        existing_filenames = set(existing_docs.keys())
+        storage_filenames = set(storage_map.keys())
 
-        to_create = storage_ids - existing_ids
-        to_check = storage_ids & existing_ids  # May need update
-        to_delete = existing_ids - storage_ids if delete_missing else set()
+        to_create = storage_filenames - existing_filenames
+        to_check = storage_filenames & existing_filenames  # May need update
+        to_delete = existing_filenames - storage_filenames if delete_missing else set()
 
         logger.info(
             f"Changes: {len(to_create)} new, {len(to_check)} to check, "
             f"{len(to_delete)} to delete"
         )
 
-        # Step 4: Process new files
-        for doc_id in to_create:
-            key = storage_map[doc_id]
+        # Step 4: Process new files (sorted by last_modified descending - newest first)
+        to_create_sorted = sorted(
+            to_create,
+            key=lambda filename: storage_map[filename]['last_modified'],
+            reverse=True
+        )
+
+        for filename in to_create_sorted:
+            # Stop if we've reached the count limit
+            if count is not None and stats.created >= count:
+                logger.info(f"Reached count limit of {count} created documents")
+                break
+
+            key = storage_map[filename]['key']
             try:
                 content = get_object(key, decode=True, parse_json=False)
                 if content is None:
@@ -133,59 +133,61 @@ def ingest_notes(prefix: str = "notes/", delete_missing: bool = True) -> dict:
 
                 content_hash = _compute_hash(content)
                 doc = Document(
-                    id=doc_id,
-                    filename=doc_id,
+                    id=str(uuid.uuid4()),
+                    filename=filename,
                     s3_key=key,
                     doc_type=1,
                     content_hash=content_hash,
-                    title=_extract_title(content, doc_id),
+                    title=_extract_title(content, filename),
                     content_text=content[:16384],
                 )
                 session.add(doc)
                 stats.created += 1
-                logger.debug(f"Created: {doc_id}")
+                logger.debug(f"Created: {filename}")
 
             except Exception as e:
                 logger.error(f"Error creating {key}: {e}")
                 stats.errors.append({"key": key, "error": str(e)})
 
-        # Step 5: Check existing files for updates
-        for doc_id in to_check:
-            key = storage_map[doc_id]
-            try:
-                content = get_object(key, decode=True, parse_json=False)
-                if content is None:
-                    stats.errors.append({"key": key, "error": "Could not read"})
-                    continue
+        # (skip if count is specified)
+        if count is None:
+            # Step 5: Check existing files for updates
+            for filename in to_check:
+                key = storage_map[filename]['key']
+                try:
+                    content = get_object(key, decode=True, parse_json=False)
+                    if content is None:
+                        stats.errors.append({"key": key, "error": "Could not read"})
+                        continue
 
-                content_hash = _compute_hash(content)
+                    content_hash = _compute_hash(content)
 
-                # Skip if unchanged
-                if existing_docs[doc_id] == content_hash:
-                    stats.unchanged += 1
-                    continue
+                    # Skip if unchanged
+                    if existing_docs[filename] == content_hash:
+                        stats.unchanged += 1
+                        continue
 
-                # Update changed document
-                doc = session.query(Document).filter(Document.id == doc_id).first()
-                if doc:
-                    doc.s3_key = key
-                    doc.content_hash = content_hash
-                    doc.title = _extract_title(content, doc_id)
-                    doc.content_text = content[:16384]
-                    stats.updated += 1
-                    logger.debug(f"Updated: {doc_id}")
+                    # Update changed document
+                    doc = session.query(Document).filter(Document.filename == filename).first()
+                    if doc:
+                        doc.s3_key = key
+                        doc.content_hash = content_hash
+                        doc.title = _extract_title(content, filename)
+                        doc.content_text = content[:16384]
+                        stats.updated += 1
+                        logger.debug(f"Updated: {filename}")
 
-            except Exception as e:
-                logger.error(f"Error updating {key}: {e}")
-                stats.errors.append({"key": key, "error": str(e)})
+                except Exception as e:
+                    logger.error(f"Error updating {key}: {e}")
+                    stats.errors.append({"key": key, "error": str(e)})
 
-        # Step 6: Delete removed files
-        if to_delete:
-            session.query(Document).filter(Document.id.in_(to_delete)).delete(
-                synchronize_session=False
-            )
-            stats.deleted = len(to_delete)
-            logger.info(f"Deleted {stats.deleted} notes")
+            # Step 6: Delete removed files
+            if to_delete:
+                session.query(Document).filter(Document.filename.in_(to_delete)).delete(
+                    synchronize_session=False
+                )
+                stats.deleted = len(to_delete)
+                logger.info(f"Deleted {stats.deleted} notes")
 
         # Step 7: Fix NULL titles using filename as fallback
         docs_without_title = (
@@ -195,14 +197,15 @@ def ingest_notes(prefix: str = "notes/", delete_missing: bool = True) -> dict:
         )
         if docs_without_title:
             for doc in docs_without_title:
-                doc.title = doc.id.removesuffix(".md")
+                doc.title = doc.filename.removesuffix(".md")
             logger.info(f"Fixed {len(docs_without_title)} NULL titles")
 
         # Step 8: Update tsvectors for all documents with NULL tsvector (must run after title fix)
+        # Use 'simple' config for universal language support (CJK uses pg_bigm separately)
         logger.info("Updating tsvectors...")
         result = session.execute(text("""
             UPDATE documents
-            SET content_tsvector = to_tsvector('english', coalesce(title, '') || ' ' || content_text)
+            SET content_tsvector = to_tsvector('simple', coalesce(title, '') || ' ' || content_text)
             WHERE content_tsvector IS NULL
         """))
         tsvector_updated = result.rowcount
@@ -226,7 +229,7 @@ def ingest_notes(prefix: str = "notes/", delete_missing: bool = True) -> dict:
                     for doc in batch
                 ]
                 try:
-                    embeddings = _get_embeddings(texts)
+                    embeddings = get_embeddings(texts)
                     for doc, embedding in zip(batch, embeddings):
                         doc.embedding = embedding
                     logger.info(f"Generated embeddings for batch {i // batch_size + 1}")
@@ -253,18 +256,144 @@ def ingest_notes(prefix: str = "notes/", delete_missing: bool = True) -> dict:
     }
 
 
+def fill_null_embeddings(batch_size: int = 100) -> dict:
+    """
+    Check for documents with NULL embeddings and fill them.
+
+    Args:
+        batch_size: Number of documents to process per batch (default: 100)
+
+    Returns:
+        dict with status and statistics
+    """
+    logger.info("Starting fill_null_embeddings task")
+    success_count = 0
+    error_count = 0
+    errors = []
+
+    with get_db() as session:
+        # Find all documents with NULL embeddings
+        docs_needing_embedding = (
+            session.query(Document)
+            .filter(Document.embedding.is_(None))
+            .all()
+        )
+
+        total_docs = len(docs_needing_embedding)
+        logger.info(f"Found {total_docs} documents with NULL embeddings")
+
+        if not docs_needing_embedding:
+            return {
+                "status": "success",
+                "message": "No documents need embeddings",
+                "total": 0,
+                "success": 0,
+                "errors": 0,
+            }
+
+        # Process in batches
+        for i in range(0, total_docs, batch_size):
+            batch = docs_needing_embedding[i:i + batch_size]
+            batch_num = i // batch_size + 1
+
+            # Prepare texts, filtering out empty ones
+            texts = []
+            valid_docs = []
+            for doc in batch:
+                text = f"{doc.title or ''} {doc.content_text or ''}".strip()
+                if text:
+                    texts.append(text)
+                    valid_docs.append(doc)
+                else:
+                    logger.warning(f"Skipping document {doc.id} - empty text")
+                    error_count += 1
+                    errors.append({
+                        "doc_id": doc.id,
+                        "error": "Empty text content"
+                    })
+
+            if not texts:
+                logger.warning(f"Batch {batch_num}: No valid texts to process")
+                continue
+
+            try:
+                logger.info(f"Processing batch {batch_num}/{(total_docs + batch_size - 1) // batch_size} ({len(texts)} docs)")
+                embeddings = get_embeddings(texts)
+
+                # Validate we got embeddings back
+                if not embeddings:
+                    raise ValueError("No embedding data received")
+
+                if len(embeddings) != len(texts):
+                    raise ValueError(f"Expected {len(texts)} embeddings, got {len(embeddings)}")
+
+                # Assign embeddings to documents
+                for doc, embedding in zip(valid_docs, embeddings):
+                    if embedding and len(embedding) > 0:
+                        doc.embedding = embedding
+                        success_count += 1
+                    else:
+                        logger.warning(f"Empty embedding for document {doc.id}")
+                        error_count += 1
+                        errors.append({
+                            "doc_id": doc.id,
+                            "error": "Empty embedding vector"
+                        })
+
+                session.commit()
+                logger.info(f"Batch {batch_num} complete: {len(embeddings)} embeddings generated")
+
+            except Exception as e:
+                logger.error(f"Error processing batch {batch_num}: {e}")
+                error_count += len(texts)
+                errors.append({
+                    "batch": batch_num,
+                    "count": len(texts),
+                    "error": str(e)
+                })
+                session.rollback()
+
+    logger.info(f"Fill embeddings complete: {success_count} success, {error_count} errors")
+
+    return {
+        "status": "success" if error_count == 0 else "partial",
+        "message": f"Processed {total_docs} documents: {success_count} success, {error_count} errors",
+        "total": total_docs,
+        "success": success_count,
+        "errors": error_count,
+        "error_details": errors if errors else None,
+    }
+
+
 def handle_ingest_notes(message: dict) -> dict:
     """
     Handle ingest_notes action from worker.
 
     Args:
         message: Message dict with optional fields:
-            - prefix: Storage prefix (default: "notes/")
+            - prefix: Storage prefix (default: "")
             - delete_missing: Whether to delete missing docs (default: True)
+            - count: Max number of new documents to create (default: None = unlimited)
 
     Returns:
         Sync result dict
     """
-    prefix = message.get("prefix", "notes/")
+    prefix = message.get("prefix", "")
     delete_missing = message.get("delete_missing", True)
-    return ingest_notes(prefix=prefix, delete_missing=delete_missing)
+    count = message.get("count")
+    return ingest_notes(prefix=prefix, delete_missing=delete_missing, count=count)
+
+
+def handle_fill_embeddings(message: dict) -> dict:
+    """
+    Handle fill_embeddings action from worker.
+
+    Args:
+        message: Message dict with optional fields:
+            - batch_size: Number of documents per batch (default: 100)
+
+    Returns:
+        Fill embeddings result dict
+    """
+    batch_size = message.get("batch_size", 100)
+    return fill_null_embeddings(batch_size=batch_size)

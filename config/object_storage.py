@@ -1,20 +1,24 @@
 """
 Object storage utilities for TradingAgents.
 
-Supports both S3 (production) and local filesystem (development) based on
-the OBJECT_STORAGE_TYPE environment variable.
+Supports both S3-compatible storage (production) and local filesystem (development)
+based on the OBJECT_STORAGE_TYPE environment variable.
 
 Environment Variables:
     OBJECT_STORAGE_TYPE: 's3' or 'fs' (default: 'fs')
     BUCKET_NAME: S3 bucket name (required if using S3)
+    S3_ENDPOINT_URL: Custom S3 endpoint (e.g., Cloudflare R2, MinIO)
+    AWS_ACCESS_KEY_ID: S3 access key
+    AWS_SECRET_ACCESS_KEY: S3 secret key
+    AWS_REGION: AWS region (default: 'auto')
     STORAGE_ROOT: Local storage directory (default: './data/storage')
-    AWS_REGION: AWS region (default: 'us-east-1')
 """
 
 import os
 import json
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Union
+from threading import Lock
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -26,28 +30,50 @@ _storage_type: Optional[str] = None
 _s3_client = None
 _bucket_name: Optional[str] = None
 _storage_root: Optional[Path] = None
+_init_lock = Lock()
 
 
 def _init_storage():
-    """Initialize storage configuration on first use"""
+    """Initialize storage configuration on first use (thread-safe)"""
     global _storage_type, _s3_client, _bucket_name, _storage_root
 
-    if _storage_type is not None:
-        return
+    # Quick check without lock for performance
+    storage_type = os.getenv("OBJECT_STORAGE_TYPE_DEV", os.getenv("OBJECT_STORAGE_TYPE", "fs")).lower()
 
-    _storage_type = os.getenv("OBJECT_STORAGE_TYPE_DEV", os.getenv("OBJECT_STORAGE_TYPE", "fs")).lower()
+    if storage_type == "s3" and _s3_client is not None:
+        return  # Already initialized
+    elif storage_type != "s3" and _storage_root is not None:
+        return  # Already initialized
 
-    if _storage_type == "s3":
-        import boto3
-        _s3_client = boto3.client('s3', region_name=os.getenv("AWS_REGION", "us-east-1"))
-        _bucket_name = os.getenv("BUCKET_NAME")
-        if not _bucket_name:
-            raise ValueError("BUCKET_NAME environment variable required for S3 storage")
-        logger.info(f"Initialized S3 object storage: {_bucket_name}")
-    else:
-        _storage_root = Path(os.getenv("STORAGE_ROOT", "./data/storage"))
-        _storage_root.mkdir(parents=True, exist_ok=True)
-        logger.info(f"Initialized filesystem object storage: {_storage_root}")
+    # Acquire lock for initialization
+    with _init_lock:
+        # Double-check after acquiring lock
+        if storage_type == "s3":
+            if _s3_client is not None:
+                return  # Already initialized by another thread
+        else:
+            if _storage_root is not None:
+                return  # Already initialized by another thread
+
+        _storage_type = storage_type
+
+        if _storage_type == "s3":
+            import boto3
+            _s3_client = boto3.client(
+                's3',
+                endpoint_url=os.getenv("S3_ENDPOINT_URL"),
+                aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
+                aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+                region_name=os.getenv("AWS_REGION", "auto"),
+            )
+            _bucket_name = os.getenv("BUCKET_NAME")
+            if not _bucket_name:
+                raise ValueError("BUCKET_NAME environment variable required for S3 storage")
+            logger.info(f"Initialized S3 object storage: {_bucket_name}")
+        else:
+            _storage_root = Path(os.getenv("STORAGE_ROOT", "./data/storage"))
+            _storage_root.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Initialized filesystem object storage: {_storage_root}")
 
 
 def get_object(
@@ -229,6 +255,81 @@ def list_objects(
 
     except Exception as e:
         logger.error(f"Error listing objects with prefix '{prefix}': {e}")
+        return []
+
+
+def list_objects_with_metadata(
+    prefix: str = "",
+    max_keys: int = 1000
+) -> List[Dict[str, Any]]:
+    """
+    List objects with metadata including last modified time
+
+    Args:
+        prefix: Key prefix to filter objects (default: "")
+        max_keys: Maximum number of keys to return (default: 1000)
+
+    Returns:
+        List of dicts with 'key' and 'last_modified' (datetime)
+
+    Examples:
+        # List all objects with metadata
+        files = list_objects_with_metadata()
+        # [{'key': 'file.txt', 'last_modified': datetime(...)}, ...]
+
+        # List objects with prefix, sorted by last_modified
+        reports = list_objects_with_metadata(prefix='AAPL/')
+        sorted_reports = sorted(reports, key=lambda x: x['last_modified'], reverse=True)
+    """
+    from datetime import datetime
+
+    _init_storage()
+    objects = []
+
+    try:
+        if _storage_type == "s3":
+            paginator = _s3_client.get_paginator('list_objects_v2')
+            pages = paginator.paginate(
+                Bucket=_bucket_name,
+                Prefix=prefix,
+                PaginationConfig={'MaxItems': max_keys}
+            )
+
+            for page in pages:
+                if 'Contents' in page:
+                    for obj in page['Contents']:
+                        objects.append({
+                            'key': obj['Key'],
+                            'last_modified': obj['LastModified']
+                        })
+
+            logger.info(f"Listed {len(objects)} objects with metadata from s3://{_bucket_name}/{prefix}")
+        else:
+            search_path = _storage_root / prefix if prefix else _storage_root
+            if search_path.exists():
+                for file_path in search_path.rglob('*'):
+                    if file_path.is_file():
+                        # Get relative path from storage root
+                        rel_path = file_path.relative_to(_storage_root)
+                        key = str(rel_path).replace('\\', '/')
+
+                        # Get file modification time
+                        mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
+
+                        objects.append({
+                            'key': key,
+                            'last_modified': mtime
+                        })
+
+                        if len(objects) >= max_keys:
+                            break
+
+            logger.info(f"Listed {len(objects)} objects with metadata from {search_path}")
+
+        return objects
+
+    except Exception as e:
+        logger.error(f"Error listing objects with metadata for prefix '{prefix}': {e}")
         return []
 
 
